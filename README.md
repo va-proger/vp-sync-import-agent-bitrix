@@ -199,6 +199,150 @@ sudo -u bitrix php -f /var/www/project/public_html/bitrix/modules/main/tools/cro
 
 ---
 
+## После загрузки — что выполнять
+
+После успешного скачивания архива агент может не только запускать внешний CLI-скрипт через `exec`, но и вызвать любую функцию, статический метод класса или выполнить PHP-код. Это даёт гибкость: можно запускать встроенный импорт, вызывать воркеры, триггерить хуки и т.п.
+
+Ниже — безопасные и практичные варианты выполнения:
+
+### 1) Вызов внешнего CLI (уже есть)
+
+Один из безопасных и простых вариантов — запуск CLI-скрипта и логирование вывода:
+
+```php
+$phpPath    = '/usr/bin/php';
+$cliScript  = $documentRoot . '/bitrix_cml_zip_cli.php';
+$logFile    = $localDir . 'cli.log';
+
+$cmd = sprintf(
+    '%s %s --base=%s --zipfile=%s >> %s 2>&1',
+    escapeshellcmd($phpPath),
+    escapeshellarg($cliScript),
+    escapeshellarg('https://example.com'), // обезличено
+    escapeshellarg($localFile),
+    escapeshellarg($logFile)
+);
+
+exec($cmd, $output, $code);
+AddMessage2Log("Exec code: {$code}");
+AddMessage2Log("Exec output: " . implode("\n", $output));
+```
+
+**Плюсы:** изолированность, можно смотреть stdout/stderr в лог-файле.
+**Минусы:** работа через shell — следи за `escapeshellarg()` и правами.
+
+---
+
+### 2) Вызов локальной функции/метода PHP (без shell)
+
+Если импорт реализован в виде функции/метода в кодовой базе — вызывай его напрямую (быстрее и безопаснее):
+
+```php
+// пример: функция из другого файла
+require_once $documentRoot . '/local/php_interface/import_handlers.php';
+
+// вызываем функцию импорта, передаём путь к файлу
+try {
+    $result = my_local_import_function($localFile);
+    AddMessage2Log("Local import finished: " . var_export($result, true));
+} catch (\Throwable $e) {
+    AddMessage2Log("Local import error: " . $e->getMessage());
+}
+```
+
+Или статический метод класса:
+
+```php
+try {
+    \VProger\Core\Importer::runFromZip($localFile);
+    AddMessage2Log("Importer::runFromZip completed");
+} catch (\Throwable $e) {
+    AddMessage2Log("Importer error: " . $e->getMessage());
+}
+```
+
+**Плюсы:** безопасно, исключения ловятся внутри PHP, нет лишнего shell-уровня.
+**Минусы:** код выполняется в том же процессе, что и агент — контролируй таймауты/память.
+
+---
+
+### 3) Выполнение небольшого PHP-скрипта через CLI (`php -r` или отдельный файл)
+
+Если нужно изолировать выполнение (другой пользователь, другое окружение), положи файл-обёртку и запусти его через `php`:
+
+```php
+// build safe command
+$wrapper = $documentRoot . '/local/tools/import_wrapper.php';
+$cmd = sprintf('%s %s %s >> %s 2>&1',
+    escapeshellcmd('/usr/bin/php'),
+    escapeshellarg($wrapper),
+    escapeshellarg($localFile),        // аргумент: путь к файлу
+    escapeshellarg($localDir . 'cli.log')
+);
+
+exec($cmd, $output, $code);
+AddMessage2Log("Wrapper exec code: {$code}");
+```
+
+`import_wrapper.php` — простой CLI-скрипт, который подключает минимальный bootstrap и вызывает нужную функцию. Такой подход позволяет запускать от имени другого системного пользователя через `sudo -u` в crontab, если нужно.
+
+**Плюсы:** изоляция, можно запускать под другим пользователем/с правами.
+**Минусы:** нужно обеспечить безопасный wrapper и валидацию входных аргументов.
+
+---
+
+### 4) Запуск произвольного кода через `proc_open()` (для сложной коммуникации)
+
+Если нужно читать/писать stdin/stdout процесса — используй `proc_open()` с явным описанием потоков. Это даёт больше контроля, но сложнее в эксплуатации. Пример здесь опущён для краткости — использовать только если действительно нужно.
+
+---
+
+## Рекомендации по безопасности при выполнении кода
+
+1. **Никогда не формируй команду с пользовательским вводом** без строгой валидации. Всегда использовать `escapeshellcmd()`/`escapeshellarg()` при shell-вызовах.
+2. **Предпочти локальный вызов PHP-функции/метода** (вариант 2) — он безопаснее и проще для отладки.
+3. **Используй wrapper-скрипт**, если нужно выполнение в отдельном процессе/пользователе. Wrapper должен:
+
+   * иметь фиксированный набор аргументов;
+   * валидировать путь к файлу (реальный `realpath()` и проверка, что файл внутри ожидаемой директории);
+   * логировать и возвращать коды ошибок.
+4. **Логируй вывод и код возврата** (`$output`, `$code`) — это помогает быстро понять, что пошло не так.
+5. **Ограничь права**: если используешь ключи, положи их в защищённую папку и выставь права (owner/group) — не делай ключ общедоступным.
+6. **Не запускай непроверенный чужой код** — если wrapper загружает внешний плагин, проверяй подпись/хэши.
+7. **Обрабатывай исключения** и всегда удаляй lock-файл в `finally` (как у тебя уже реализовано).
+
+---
+
+## Пример: выбор между exec и локальным вызовом в агенте
+
+```php
+// после успешного скачивания:
+$useLocal = true;
+
+if ($useLocal) {
+    // надёжный локальный вызов
+    try {
+        \VProger\Core\Importer::runFromZip($localFile);
+        AddMessage2Log("Local import OK");
+    } catch (\Throwable $e) {
+        AddMessage2Log("Local import failed: ".$e->getMessage());
+    }
+} else {
+    // запуск wrapper'а в отдельном процессе
+    $wrapper = $documentRoot . '/local/tools/import_wrapper.php';
+    $cmd = sprintf('%s %s %s >> %s 2>&1',
+        escapeshellcmd('/usr/bin/php'),
+        escapeshellarg($wrapper),
+        escapeshellarg($localFile),
+        escapeshellarg($localDir . 'cli.log')
+    );
+    exec($cmd, $output, $code);
+    AddMessage2Log("Wrapper exit {$code}: ".implode("\n", $output));
+}
+```
+
+---
+
 ## Логи и отладка
 
 * `AddMessage2Log()` → смотрите в системном логе Bitrix (если настроен `LOG_FILENAME` в `dbconn.php`)
